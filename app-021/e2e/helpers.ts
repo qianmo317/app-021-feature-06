@@ -52,10 +52,15 @@ export async function addStudent(page: Page, s: NewStudent) {
   await expect(page.locator(`[data-testid="student-row"][data-name="${s.name}"]`)).toBeVisible()
 }
 
+/** 批量粘贴 → 预览 → 确认导入 → 关闭结果页 */
 export async function bulkAdd(page: Page, text: string) {
   await page.getByRole('button', { name: '批量粘贴' }).click()
   await page.getByTestId('bulk-text').fill(text)
+  await expect(page.getByTestId('bulk-row').first()).toBeVisible()
   await page.getByTestId('bulk-add').click()
+  await expect(page.getByTestId('bulk-added-count')).toBeVisible()
+  await page.getByTestId('bulk-done').click()
+  await expect(page.getByTestId('bulk-modal')).toBeHidden()
 }
 
 /** 生成轮换并等待完成 */

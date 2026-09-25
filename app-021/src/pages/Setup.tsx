@@ -4,12 +4,21 @@ import { useStore } from '../store'
 import type { ClassEntity, LayoutConfig, Student } from '../types'
 import { buildSeats, specialLabel, visionLabel } from '../lib/layout'
 import { validateClass } from '../lib/validate'
+import {
+  bulkSummary,
+  evaluateBulkRows,
+  parseBulkText,
+  toStudents,
+  type BulkDraftRow,
+  type BulkEvaluatedRow,
+} from '../lib/bulk'
 import { uid } from '../lib/id'
 import { SeatGrid } from '../components/SeatGrid'
 import {
   AlertTriangle,
   ArrowLeft,
-  Eraser,
+  CheckCircle2,
+  ClipboardPaste,
   Rows3,
   Settings2,
   Table2,
@@ -36,12 +45,14 @@ export function Setup({ classId }: { classId: string }) {
   const errors = validateClass(cls)
   const hasPlan = cls.assignments.length > 0
 
-  const save = (next: ClassEntity, configChanged = false) => {
+  // 返回 false 表示用户在确认框里取消（调用方应停留在原弹窗）
+  const save = (next: ClassEntity, configChanged = false): boolean => {
     if (configChanged && hasPlan) {
       const ok = window.confirm('配置已变更，将清空已生成的轮换结果。继续？')
-      if (!ok) return
+      if (!ok) return false
     }
     updateSetup(next, configChanged)
+    return true
   }
 
   return (
@@ -120,8 +131,9 @@ export function Setup({ classId }: { classId: string }) {
           cls={cls}
           onClose={() => setBulkOpen(false)}
           onAdd={(list) => {
-            save({ ...cls, students: [...cls.students, ...list] }, true)
-            setBulkOpen(false)
+            // 确认导入之前不写进班级；保存被取消（如拒绝清空旧计划）时留在弹窗里。
+            // 成功后不关闭弹窗：由结果页展示新增/跳过明细，点「完成」才关闭。
+            return save({ ...cls, students: [...cls.students, ...list] }, true)
           }}
         />
       )}
@@ -537,7 +549,15 @@ function StudentModal({
   )
 }
 
-// ---------- 批量粘贴 ----------
+// ---------- 批量粘贴：先预览再入库 ----------
+// 阶段：edit（粘贴/逐行修改）→ result（本次导入结果）。确认之前不调用 onAdd、不写进班级。
+type BulkPhase = 'edit' | 'result'
+
+interface BulkResult {
+  added: BulkEvaluatedRow[]
+  skipped: BulkEvaluatedRow[]
+}
+
 function BulkModal({
   cls,
   onClose,
@@ -545,60 +565,325 @@ function BulkModal({
 }: {
   cls: ClassEntity
   onClose: () => void
-  onAdd: (list: Student[]) => void
+  onAdd: (list: Student[]) => boolean
 }) {
+  // 弹窗打开瞬间固定「现有名单」快照，评定重名时以此为准；「回去改」后把已导入姓名并入
+  const [existingNames, setExistingNames] = useState<string[]>(() => cls.students.map((s) => s.name))
+  const [phase, setPhase] = useState<BulkPhase>('edit')
   const [text, setText] = useState('')
-  const parsed = useMemo(() => {
-    return text
-      .split('\n')
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .map((line) => {
-        const [name, h, note] = line.split(/[,，\t]/).map((s) => s.trim())
-        const height = h && /^\d+(\.\d+)?$/.test(h) ? Number(h) : undefined
-        return { name, heightCm: height, note }
-      })
-  }, [text])
-  const dupes = parsed.filter((p) => cls.students.some((s) => s.name === p.name)).map((p) => p.name)
+  const [rows, setRows] = useState<BulkDraftRow[] | null>(null)
+  const [resumeMode, setResumeMode] = useState(false)
+  const [onlyIssues, setOnlyIssues] = useState(false)
+  const [result, setResult] = useState<BulkResult | null>(null)
+
+  const evaluated = useMemo(
+    () => (rows === null ? [] : evaluateBulkRows(rows, existingNames)),
+    [rows, existingNames],
+  )
+  const summary = useMemo(() => bulkSummary(evaluated), [evaluated])
+  const visibleRows = onlyIssues ? evaluated.filter((r) => r.status !== 'ok') : evaluated
+
+  // 就地编辑用物理行号定位（visibleRows 可能被「只看问题行」过滤）
+  const patchRow = (lineNo: number, patch: Partial<BulkDraftRow>) => {
+    setRows((prev) =>
+      prev === null
+        ? prev
+        : prev.map((r) => (r.lineNo === lineNo ? { ...r, ...patch, edited: true } : r)),
+    )
+  }
+
+  const removeRow = (lineNo: number) => {
+    setRows((prev) => (prev === null ? prev : prev.filter((r) => r.lineNo !== lineNo)))
+  }
+
+  const confirm = () => {
+    const importable = evaluated.filter((r) => r.importable)
+    if (importable.length === 0) return
+    if (!onAdd(toStudents(evaluated))) return // 保存被取消（清空旧计划确认框）
+    setResult({ added: importable, skipped: evaluated.filter((r) => !r.importable) })
+    setPhase('result')
+  }
+
+  // 把没导入的行带回编辑阶段继续改（已成功导入的姓名此时进入「现有名单」）
+  const resumeEdit = () => {
+    if (!result) return
+    setExistingNames((prev) => [...prev, ...result.added.map((r) => r.name)])
+    setRows(result.skipped.map(({ lineNo, name, heightText, note, extra, edited }) => ({ lineNo, name, heightText, note, extra, edited })))
+    setResumeMode(true)
+    setOnlyIssues(true)
+    setResult(null)
+    setPhase('edit')
+  }
 
   return (
     <div className="modal-mask" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <h2>批量添加学生</h2>
-        <p className="muted small">每行一个学生，可用逗号附加身高与备注：`张三,152,戴眼镜`</p>
-        <textarea
-          className="textarea"
-          rows={10}
-          value={text}
-          data-testid="bulk-text"
-          placeholder={'张三,152\n李四,148,视力需关注\n王五'}
-          onChange={(e) => setText(e.target.value)}
-        />
-        <p className="muted small">
-          解析到 {parsed.length} 名学生{dupes.length > 0 && <>；与现有名单重名：{dupes.join('、')}（重名将跳过）</>}
-        </p>
-        <div className="modal-actions">
-          <span className="spacer" />
-          <button className="btn" onClick={onClose}>
-            取消
-          </button>
-          <button
-            className="btn btn-primary"
-            data-testid="bulk-add"
-            disabled={parsed.length === 0}
-            onClick={() =>
-              onAdd(
-                parsed
-                  .filter((p) => p.name && !cls.students.some((s) => s.name === p.name))
-                  .map((p) => ({ id: uid(), name: p.name, heightCm: p.heightCm, vision: 'none', mustApartFrom: [], note: p.note }) as Student),
-              )
-            }
-          >
-            <Eraser size={14} style={{ display: 'none' }} /> 添加 {parsed.length} 人
-          </button>
-        </div>
+      <div className="modal modal-lg" onClick={(e) => e.stopPropagation()} data-testid="bulk-modal">
+        <h2>
+          <ClipboardPaste size={18} /> 批量添加学生
+        </h2>
+
+        {phase === 'edit' && (
+          <>
+            {resumeMode ? (
+              <p className="muted small" data-testid="bulk-resume-hint">
+                下面是上次未导入的 {rows?.length ?? 0} 行，请就地改好后再次确认导入。
+              </p>
+            ) : (
+              <>
+                <p className="muted small">
+                  每行一个学生，字段顺序为「姓名, 身高, 备注」，分隔符支持半角逗号、中文逗号「，」或制表符（从
+                  Excel/WPS 直接粘贴即可）。身高与备注可省略，如「张三,152,戴眼镜」「王五」。
+                </p>
+                <textarea
+                  className="textarea"
+                  rows={8}
+                  value={text}
+                  data-testid="bulk-text"
+                  placeholder={'张三,152\n李四,148,视力需关注\n王五\n赵六,abc\n,150,没有姓名'}
+                  onChange={(e) => {
+                    setText(e.target.value)
+                    setRows(parseBulkText(e.target.value))
+                  }}
+                />
+              </>
+            )}
+
+            {evaluated.length === 0 ? (
+              <p className="muted small">还没有可预览的行，粘贴名单后这里会逐行列出解析结果。</p>
+            ) : (
+              <>
+                <div className="bulk-summary" data-testid="bulk-summary">
+                  <span className="bulk-count">
+                    共 <b>{summary.total}</b> 行
+                  </span>
+                  <span className="bulk-pill bulk-ok">
+                    <CheckCircle2 size={13} /> 可导入 {summary.importable}
+                  </span>
+                  <span className={summary.duplicate ? 'bulk-pill bulk-dup' : 'bulk-pill bulk-muted'}>
+                    重名 {summary.duplicate}
+                  </span>
+                  <span className={summary.missingName ? 'bulk-pill bulk-bad' : 'bulk-pill bulk-muted'}>
+                    缺姓名 {summary.missingName}
+                  </span>
+                  <span className={summary.badHeight ? 'bulk-pill bulk-bad' : 'bulk-pill bulk-muted'}>
+                    身高非数字 {summary.badHeight}
+                  </span>
+                  <span className={summary.extraFields ? 'bulk-pill bulk-warn' : 'bulk-pill bulk-muted'}>
+                    字段过多 {summary.extraFields}
+                  </span>
+                  <label className="checkbox bulk-filter">
+                    <input
+                      type="checkbox"
+                      checked={onlyIssues}
+                      onChange={(e) => setOnlyIssues(e.target.checked)}
+                    />
+                    只看有问题的行
+                  </label>
+                </div>
+
+                <div className="table-wrap bulk-table-wrap">
+                  <table className="table bulk-table">
+                    <thead>
+                      <tr>
+                        <th className="bulk-col-line">行</th>
+                        <th>姓名</th>
+                        <th className="bulk-col-height">身高(cm)</th>
+                        <th>备注</th>
+                        <th>状态 / 原因</th>
+                        <th></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {visibleRows.map((r) => (
+                        <tr key={r.lineNo} className={`bulk-row bulk-row-${r.status}`} data-testid="bulk-row" data-line={r.lineNo} data-status={r.status}>
+                          <td className="muted">{r.lineNo}</td>
+                          <td>
+                            <input
+                              className="bulk-input"
+                              value={r.name}
+                              aria-label={`第 ${r.lineNo} 行姓名`}
+                              data-testid="bulk-name"
+                              onChange={(e) => patchRow(r.lineNo, { name: e.target.value })}
+                            />
+                          </td>
+                          <td>
+                            <input
+                              className={`bulk-input bulk-input-height${r.issues.some((i) => i.kind === 'bad_height') ? ' bulk-input-bad' : ''}`}
+                              value={r.heightText}
+                              inputMode="decimal"
+                              aria-label={`第 ${r.lineNo} 行身高`}
+                              data-testid="bulk-height"
+                              placeholder="可空"
+                              onChange={(e) => patchRow(r.lineNo, { heightText: e.target.value })}
+                            />
+                          </td>
+                          <td>
+                            <input
+                              className="bulk-input"
+                              value={r.note}
+                              aria-label={`第 ${r.lineNo} 行备注`}
+                              data-testid="bulk-note"
+                              placeholder="可空"
+                              onChange={(e) => patchRow(r.lineNo, { note: e.target.value })}
+                            />
+                          </td>
+                          <td>
+                            <span className={`bulk-tag bulk-tag-${r.status}`} data-testid="bulk-status">
+                              {STATUS_LABEL[r.status]}
+                            </span>
+                            <ul className="bulk-reasons">
+                              {r.issues.map((iss, i) => (
+                                <li key={i} className={iss.kind === 'extra_fields' ? 'warn' : 'bad'} data-testid="bulk-reason">
+                                  {iss.text}
+                                </li>
+                              ))}
+                            </ul>
+                          </td>
+                          <td>
+                            <button className="icon-btn" title="移除此行" onClick={() => removeRow(r.lineNo)}>
+                              <X size={14} />
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                {visibleRows.length === 0 && <p className="muted small">所有行都没问题，可以直接导入。</p>}
+              </>
+            )}
+
+            <div className="modal-actions">
+              <span className="spacer" />
+              <button className="btn" onClick={onClose}>
+                取消
+              </button>
+              <button
+                className="btn btn-primary"
+                data-testid="bulk-add"
+                disabled={summary.importable === 0}
+                onClick={confirm}
+              >
+                <CheckCircle2 size={15} /> 确认导入 {summary.importable} 人
+              </button>
+            </div>
+          </>
+        )}
+
+        {phase === 'result' && result && (
+          <BulkResultView result={result} onClose={onClose} onResume={result.skipped.length > 0 ? resumeEdit : undefined} />
+        )}
       </div>
     </div>
+  )
+}
+
+const STATUS_LABEL: Record<BulkEvaluatedRow['status'], string> = {
+  ok: '正常',
+  warning: '待核对',
+  duplicate: '重名',
+  invalid: '不合格',
+}
+
+// ---------- 批量导入结果 ----------
+function BulkResultView({
+  result,
+  onClose,
+  onResume,
+}: {
+  result: BulkResult
+  onClose: () => void
+  onResume?: () => void
+}) {
+  return (
+    <>
+      <div className="bulk-result-head">
+        <CheckCircle2 size={20} className="good" />
+        <span>
+          已新增 <b data-testid="bulk-added-count">{result.added.length}</b> 人
+          {result.skipped.length > 0 && (
+            <>
+              ，跳过 <b className="bad" data-testid="bulk-skipped-count">{result.skipped.length}</b> 行
+            </>
+          )}
+        </span>
+      </div>
+
+      {result.added.length > 0 && (
+        <div className="table-wrap">
+          <table className="table">
+            <thead>
+              <tr>
+                <th className="bulk-col-line">行</th>
+                <th>姓名</th>
+                <th>身高(cm)</th>
+                <th>备注</th>
+              </tr>
+            </thead>
+            <tbody>
+              {result.added.map((r) => (
+                <tr key={r.lineNo} data-testid="bulk-added-row">
+                  <td className="muted">{r.lineNo}</td>
+                  <td>{r.name}</td>
+                  <td>{r.heightCm ?? '—'}</td>
+                  <td className="muted">{r.note || '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {result.skipped.length > 0 && (
+        <>
+          <p className="small">以下 {result.skipped.length} 行未写入班级：</p>
+          <div className="table-wrap">
+            <table className="table">
+              <thead>
+                <tr>
+                  <th className="bulk-col-line">行</th>
+                  <th>姓名</th>
+                  <th>身高</th>
+                  <th>跳过原因</th>
+                </tr>
+              </thead>
+              <tbody>
+                {result.skipped.map((r) => (
+                  <tr key={r.lineNo} data-testid="bulk-skipped-row">
+                    <td className="muted">{r.lineNo}</td>
+                    <td>{r.name || <span className="bad">（空）</span>}</td>
+                    <td className={r.issues.some((i) => i.kind === 'bad_height') ? 'bad' : ''}>{r.heightText || '—'}</td>
+                    <td>
+                      <ul className="bulk-reasons">
+                        {r.issues
+                          .filter((i) => i.kind === 'missing_name' || i.kind === 'bad_height' || i.kind === 'duplicate')
+                          .map((iss, i) => (
+                            <li key={i} className="bad">
+                              {iss.text}
+                            </li>
+                          ))}
+                      </ul>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+
+      <div className="modal-actions">
+        <span className="spacer" />
+        {onResume && (
+          <button className="btn" data-testid="bulk-resume" onClick={onResume}>
+            回去改这 {result.skipped.length} 行
+          </button>
+        )}
+        <button className="btn btn-primary" data-testid="bulk-done" onClick={onClose}>
+          完成
+        </button>
+      </div>
+    </>
   )
 }
 
