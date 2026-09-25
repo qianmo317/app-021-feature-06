@@ -4,12 +4,13 @@ import { useStore } from '../store'
 import type { ClassEntity, LayoutConfig, Student } from '../types'
 import { buildSeats, specialLabel, visionLabel } from '../lib/layout'
 import { validateClass } from '../lib/validate'
+import { assessRows, parseRosterText, toStudent, type ParsedLine, type ProblemType } from '../lib/roster'
 import { uid } from '../lib/id'
 import { SeatGrid } from '../components/SeatGrid'
 import {
   AlertTriangle,
   ArrowLeft,
-  Eraser,
+  CheckCircle2,
   Rows3,
   Settings2,
   Table2,
@@ -36,12 +37,13 @@ export function Setup({ classId }: { classId: string }) {
   const errors = validateClass(cls)
   const hasPlan = cls.assignments.length > 0
 
-  const save = (next: ClassEntity, configChanged = false) => {
+  const save = (next: ClassEntity, configChanged = false): boolean => {
     if (configChanged && hasPlan) {
       const ok = window.confirm('配置已变更，将清空已生成的轮换结果。继续？')
-      if (!ok) return
+      if (!ok) return false
     }
     updateSetup(next, configChanged)
+    return true
   }
 
   return (
@@ -119,10 +121,7 @@ export function Setup({ classId }: { classId: string }) {
         <BulkModal
           cls={cls}
           onClose={() => setBulkOpen(false)}
-          onAdd={(list) => {
-            save({ ...cls, students: [...cls.students, ...list] }, true)
-            setBulkOpen(false)
-          }}
+          onAdd={(list) => save({ ...cls, students: [...cls.students, ...list] }, true)}
         />
       )}
     </div>
@@ -537,7 +536,26 @@ function StudentModal({
   )
 }
 
-// ---------- 批量粘贴 ----------
+// ---------- 批量粘贴（粘贴 → 预览/就地修正 → 确认导入 → 结果明细） ----------
+interface DraftRow extends ParsedLine {
+  key: string
+  include: boolean
+}
+
+// 就地修改以「行号:原文」为键，重新粘贴/编辑文本时已修正的行不会丢
+interface RowEdit {
+  name?: string
+  heightText?: string
+  note?: string
+  include?: boolean
+}
+
+interface SkipInfo {
+  lineNo: number
+  raw: string
+  reason: string
+}
+
 function BulkModal({
   cls,
   onClose,
@@ -545,58 +563,255 @@ function BulkModal({
 }: {
   cls: ClassEntity
   onClose: () => void
-  onAdd: (list: Student[]) => void
+  onAdd: (list: Student[]) => boolean // 返回 false = 用户取消了清空确认，未写入
 }) {
   const [text, setText] = useState('')
-  const parsed = useMemo(() => {
-    return text
-      .split('\n')
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .map((line) => {
-        const [name, h, note] = line.split(/[,，\t]/).map((s) => s.trim())
-        const height = h && /^\d+(\.\d+)?$/.test(h) ? Number(h) : undefined
-        return { name, heightCm: height, note }
-      })
-  }, [text])
-  const dupes = parsed.filter((p) => cls.students.some((s) => s.name === p.name)).map((p) => p.name)
+  const [edits, setEdits] = useState<Map<string, RowEdit>>(new Map())
+  const [result, setResult] = useState<{ added: number; skipped: SkipInfo[] } | null>(null)
+
+  const parsed = useMemo(() => parseRosterText(text), [text])
+  const rows: DraftRow[] = useMemo(
+    () =>
+      parsed.map((p) => {
+        const key = `${p.lineNo}:${p.raw}`
+        const e = edits.get(key)
+        return {
+          ...p,
+          key,
+          name: e?.name ?? p.name,
+          heightText: e?.heightText ?? p.heightText,
+          note: e?.note ?? p.note,
+          include: e?.include ?? true,
+        }
+      }),
+    [parsed, edits],
+  )
+  const existingNames = useMemo(() => cls.students.map((s) => s.name), [cls.students])
+  const problems = useMemo(() => assessRows(rows, existingNames), [rows, existingNames])
+
+  const patchRow = (key: string, patch: RowEdit) => {
+    setEdits((prev) => {
+      const next = new Map(prev)
+      next.set(key, { ...next.get(key), ...patch })
+      return next
+    })
+  }
+
+  const brokenCount = problems.filter((ps) => ps.length > 0).length
+  const importCount = rows.filter((r, i) => r.include && problems[i].length === 0).length
+  const manualSkip = rows.filter((r) => !r.include).length
+  const countOf = (t: ProblemType) => problems.filter((ps) => ps.some((p) => p.type === t)).length
+
+  const confirm = () => {
+    const toAdd = rows.filter((r, i) => r.include && problems[i].length === 0).map(toStudent)
+    const skipped: SkipInfo[] = rows
+      .map((r, i) => ({ row: r, ps: problems[i] }))
+      .filter((x) => !(x.row.include && x.ps.length === 0))
+      .map((x) => ({
+        lineNo: x.row.lineNo,
+        raw: x.row.raw,
+        reason: x.ps.length > 0 ? x.ps.map((p) => p.message).join('；') : '已取消勾选',
+      }))
+    if (!onAdd(toAdd)) return // 用户取消了「清空轮换结果」确认：保持编辑态，未写入任何数据
+    setResult({ added: toAdd.length, skipped })
+  }
 
   return (
     <div className="modal-mask" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <h2>批量添加学生</h2>
-        <p className="muted small">每行一个学生，可用逗号附加身高与备注：`张三,152,戴眼镜`</p>
-        <textarea
-          className="textarea"
-          rows={10}
-          value={text}
-          data-testid="bulk-text"
-          placeholder={'张三,152\n李四,148,视力需关注\n王五'}
-          onChange={(e) => setText(e.target.value)}
-        />
-        <p className="muted small">
-          解析到 {parsed.length} 名学生{dupes.length > 0 && <>；与现有名单重名：{dupes.join('、')}（重名将跳过）</>}
-        </p>
-        <div className="modal-actions">
-          <span className="spacer" />
-          <button className="btn" onClick={onClose}>
-            取消
-          </button>
-          <button
-            className="btn btn-primary"
-            data-testid="bulk-add"
-            disabled={parsed.length === 0}
-            onClick={() =>
-              onAdd(
-                parsed
-                  .filter((p) => p.name && !cls.students.some((s) => s.name === p.name))
-                  .map((p) => ({ id: uid(), name: p.name, heightCm: p.heightCm, vision: 'none', mustApartFrom: [], note: p.note }) as Student),
-              )
-            }
-          >
-            <Eraser size={14} style={{ display: 'none' }} /> 添加 {parsed.length} 人
-          </button>
-        </div>
+      <div className="modal modal-wide" onClick={(e) => e.stopPropagation()} data-testid="bulk-modal">
+        {result ? (
+          <>
+            <h2>
+              <CheckCircle2 size={18} /> 导入结果
+            </h2>
+            <p data-testid="bulk-result">
+              已新增 <b>{result.added}</b> 人
+              {result.skipped.length > 0 ? (
+                <>
+                  ，跳过 <b>{result.skipped.length}</b> 行
+                </>
+              ) : (
+                '，粘贴的行全部导入'
+              )}
+              。
+            </p>
+            {result.skipped.length > 0 && (
+              <ul className="bulk-skip-list" data-testid="bulk-skipped">
+                {result.skipped.map((s) => (
+                  <li key={s.lineNo}>
+                    第 {s.lineNo} 行「{s.raw}」：{s.reason}
+                  </li>
+                ))}
+              </ul>
+            )}
+            <div className="modal-actions">
+              <span className="spacer" />
+              <button className="btn btn-primary" data-testid="bulk-done" onClick={onClose}>
+                完成
+              </button>
+            </div>
+          </>
+        ) : (
+          <>
+            <h2>批量添加学生</h2>
+            <p className="muted small">
+              每行一个学生：「姓名,身高,备注」（逗号 / 顿号 / 分号 / 制表符分隔均可，可从 Excel 直接粘贴）。
+              粘贴后先在下方预览核对、就地修正，<b>确认导入前不会写入班级</b>。
+            </p>
+            <textarea
+              className="textarea"
+              rows={6}
+              value={text}
+              data-testid="bulk-text"
+              placeholder={'张三,152\n李四,148,视力需关注\n王五'}
+              onChange={(e) => setText(e.target.value)}
+            />
+            {rows.length > 0 && (
+              <>
+                <div className="bulk-summary" data-testid="bulk-summary">
+                  <span>共 {rows.length} 行</span>
+                  <span className="good">可导入 {importCount} 行</span>
+                  {brokenCount > 0 && (
+                    <span className="bad">
+                      需修正 {brokenCount} 行（重名 {countOf('duplicate')} · 缺姓名 {countOf('missing')} · 身高异常{' '}
+                      {countOf('height')}）
+                    </span>
+                  )}
+                  {manualSkip > 0 && <span>手动跳过 {manualSkip} 行</span>}
+                </div>
+                <div className="bulk-preview-wrap">
+                  <table className="table" data-testid="bulk-preview">
+                    <thead>
+                      <tr>
+                        <th>#</th>
+                        <th>状态</th>
+                        <th>姓名</th>
+                        <th>身高(cm)</th>
+                        <th>备注</th>
+                        <th>问题与处理</th>
+                        <th>导入</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {rows.map((r, i) => {
+                        const ps = problems[i]
+                        const bad = ps.length > 0
+                        const effective = r.include && !bad
+                        const hasDupe = ps.some((p) => p.type === 'duplicate')
+                        return (
+                          <tr
+                            key={r.key}
+                            data-testid="bulk-row"
+                            data-line={r.lineNo}
+                            className={bad ? 'row-problem' : effective ? '' : 'row-excluded'}
+                          >
+                            <td className="muted">{r.lineNo}</td>
+                            <td>
+                              {bad ? (
+                                <span className="badge badge-fix">需修正</span>
+                              ) : effective ? (
+                                <span className="badge badge-ok">可导入</span>
+                              ) : (
+                                <span className="badge badge-skip">跳过</span>
+                              )}
+                            </td>
+                            <td>
+                              <input
+                                className="cell-input cell-input-name"
+                                data-testid="row-name"
+                                value={r.name}
+                                placeholder="姓名（必填）"
+                                onChange={(e) => patchRow(r.key, { name: e.target.value })}
+                              />
+                            </td>
+                            <td>
+                              <input
+                                className="cell-input cell-input-height"
+                                data-testid="row-height"
+                                value={r.heightText}
+                                placeholder="可选"
+                                onChange={(e) => patchRow(r.key, { heightText: e.target.value })}
+                              />
+                            </td>
+                            <td>
+                              <input
+                                className="cell-input"
+                                data-testid="row-note"
+                                value={r.note}
+                                placeholder={hasDupe ? '填备注可一键区分重名' : '可选'}
+                                onChange={(e) => patchRow(r.key, { note: e.target.value })}
+                              />
+                            </td>
+                            <td className="problems-cell">
+                              {bad ? (
+                                <div className="bulk-problems">
+                                  {ps.map((p, j) => (
+                                    <span key={j}>{p.message}</span>
+                                  ))}
+                                  {hasDupe && (
+                                    <span>
+                                      <button
+                                        className="btn btn-sm"
+                                        data-testid="row-distinguish"
+                                        disabled={!r.note.trim()}
+                                        title={
+                                          r.note.trim()
+                                            ? `改名为「${r.name.trim()}（${r.note.trim()}）」`
+                                            : '先在备注列填写区分说明（如：大、新转来）'
+                                        }
+                                        onClick={() =>
+                                          patchRow(r.key, { name: `${r.name.trim()}（${r.note.trim()}）` })
+                                        }
+                                      >
+                                        用备注区分
+                                      </button>{' '}
+                                      或直接改姓名；若是同一人，无需处理（该行将跳过）
+                                    </span>
+                                  )}
+                                </div>
+                              ) : (
+                                <span className="muted">—</span>
+                              )}
+                            </td>
+                            <td>
+                              <input
+                                type="checkbox"
+                                data-testid="row-include"
+                                checked={effective}
+                                disabled={bad}
+                                title={bad ? '修正问题后才能导入' : '取消勾选则跳过该行'}
+                                onChange={(e) => patchRow(r.key, { include: e.target.checked })}
+                              />
+                            </td>
+                          </tr>
+                        )
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            )}
+            <div className="modal-actions">
+              <span className="muted small">
+                {rows.length > 0
+                  ? `将导入 ${importCount} 人，跳过 ${rows.length - importCount} 行`
+                  : '粘贴名单后在此预览'}
+              </span>
+              <span className="spacer" />
+              <button className="btn" onClick={onClose}>
+                取消
+              </button>
+              <button
+                className="btn btn-primary"
+                data-testid="bulk-add"
+                disabled={importCount === 0}
+                onClick={confirm}
+              >
+                确认导入 {importCount} 人
+              </button>
+            </div>
+          </>
+        )}
       </div>
     </div>
   )

@@ -56,6 +56,7 @@ export async function bulkAdd(page: Page, text: string) {
   await page.getByRole('button', { name: '批量粘贴' }).click()
   await page.getByTestId('bulk-text').fill(text)
   await page.getByTestId('bulk-add').click()
+  await page.getByTestId('bulk-done').click()
 }
 
 /** 生成轮换并等待完成 */

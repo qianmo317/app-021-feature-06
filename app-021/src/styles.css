@@ -244,7 +244,33 @@ input:focus, select:focus, textarea:focus { outline: 2px solid var(--brand-weak)
   box-shadow: 0 20px 50px rgb(0 0 0 / 0.3); display: flex; flex-direction: column; gap: 8px;
 }
 .modal h2 { margin-bottom: 4px; }
-.modal-actions { display: flex; gap: 8px; margin-top: 10px; }
+.modal-actions { display: flex; gap: 8px; margin-top: 10px; align-items: center; }
+
+/* ---------- 批量粘贴预览 ---------- */
+.modal-wide { width: 920px; }
+.bulk-summary { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; font-size: 12.5px; color: var(--muted); }
+.bulk-preview-wrap { max-height: 340px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
+.bulk-preview-wrap .table th { position: sticky; top: 0; z-index: 1; }
+.bulk-preview-wrap .table td { vertical-align: top; }
+.row-problem { background: #fffafa; }
+.row-excluded { opacity: 0.55; }
+.cell-input {
+  font: inherit; width: 100%; padding: 4px 8px; font-size: 13px;
+  border: 1px solid var(--line); border-radius: 6px; background: #fff; color: var(--ink);
+}
+.cell-input-name { min-width: 120px; }
+.cell-input-height { width: 76px; }
+.problems-cell { white-space: normal !important; min-width: 220px; }
+.bulk-problems { display: flex; flex-direction: column; gap: 4px; color: var(--bad); font-size: 12.5px; }
+.bulk-problems .btn { margin-left: 4px; }
+.badge-ok { background: var(--good-weak); color: var(--good); }
+.badge-fix { background: var(--bad-weak); color: var(--bad); }
+.badge-skip { background: #eef1f6; color: var(--muted); }
+.bulk-skip-list {
+  display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow: auto;
+  font-size: 13px; padding: 10px 14px; background: #fafbfd;
+  border: 1px solid var(--line); border-radius: 8px;
+}
 
 /* ---------- 打印 ---------- */
 .print-toolbar {
